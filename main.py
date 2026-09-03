@@ -47,8 +47,10 @@ DEFAULT_INJECT_HINT = (
 )
 # 唤醒词回退链：按序尝试读取已安装聊天插件的唤醒词配置
 # （plugin_id 候选, 可能的配置键）
+# 注意：Z版（KiraAI_Default-Chat-Z-）的 manifest plugin_id 就是带全角括号的
+# "default-chat（z）"（已核实 znq19/KiraAI_Default-Chat-Z-），不是 z-chat 之类
 WAKE_KEYWORD_SOURCES = [
-    (("z-chat", "z_chat", "zchat", "z_chat_plugin"),
+    (("default-chat（z）",),
      ("waking_words", "wake_keywords", "wake_words")),
     (("s-chat", "s_chat", "schat", "sustained_chat", "sustained-chat"),
      ("waking_words", "wake_keywords", "wake_words")),
@@ -289,6 +291,10 @@ class MidflightMessagePlugin(BasePlugin):
                     buffer.buffer[:0] = queued
                 self._log_debug(f"{sid} 拦截消息等待超上限，已还原回 buffer")
             self._log_debug(f"{sid} 候选消息已等待 {waited} 个边界（上限 {timeout}），不再消费")
+            # 重置等待计数：本边界放弃消费，但下一边界重新从 0 计数。
+            # 若不重置，计数永久停在上限，之后所有新消息（哪怕通过全部过滤）
+            # 都会在到达这里时被直接放弃，插话功能从此失效（卡死）。
+            self._wait_steps.pop(sid, None)
             return
 
         self._gc()
@@ -436,6 +442,10 @@ class MidflightMessagePlugin(BasePlugin):
                 return
             sid = getattr(event, "sid", None) or getattr(getattr(event, "session", None), "sid", None)
             if sid:
+                # 新轮开始：旧轮若没收到收尾事件（异常路径），其 pending 消息
+                # 与等待计数会残留并被新轮继承——旧轮消息错注入新轮、新轮
+                # 继承旧轮超限计数。先清理再登记。
+                self._restore_pending_silent(sid)
                 self._run_active[sid] = {"event": event, "ts": time.time(), "ending": False}
         except Exception:
             pass
@@ -493,6 +503,13 @@ class MidflightMessagePlugin(BasePlugin):
                 return
             sid = getattr(event, "sid", None)
             if not sid:
+                return
+
+            # 会话级 override 可能禁用本插件：与 drain 路径同一判定，
+            # 否则 override 禁用的会话运行中批次仍会被拦截转入 pending，
+            # 但 _handle_tool_result 因 enabled=False 不消费，消息卡到轮结束
+            cfg = self._eff_config(sid)
+            if not cfg["enabled"]:
                 return
 
             # QueueMerge 自推送批次（积压重放）绝对放行
@@ -615,6 +632,7 @@ class MidflightMessagePlugin(BasePlugin):
         if run is not None and run.get("event") is not event:
             # 事件对象变了（旧轮没收到收尾事件）：以最新事件为准重建
             self._restore_pending_silent(sid)
+            self._wait_steps.pop(sid, None)
             run = None
         if run is None:
             self._run_active[sid] = {"event": event, "ts": time.time(), "ending": False}
@@ -630,13 +648,21 @@ class MidflightMessagePlugin(BasePlugin):
             self._log_debug(f"{sid} 运行心跳超 {self._active_timeout}s 未更新，判定已结束")
             self._run_active.pop(sid, None)
             self._restore_pending_silent(sid)
+            self._wait_steps.pop(sid, None)
             return None
         return run
 
     async def _finish_run(self, sid: str):
         """一轮结束：清标记，并把批次拦截来的待注入消息还原回 buffer 后主动 flush，
         让它们立刻走正常管线成为新一轮（不卡住、不丢失）。"""
-        self._run_active.pop(sid, None)
+        run = self._run_active.pop(sid, None)
+        self._wait_steps.pop(sid, None)
+        # 本轮注入计数一并清理：残留会随轮数无限增长，且 _gc 在超过 200 条时
+        # 整表清空会误伤仍在执行中的轮（其计数被清零 → 超额注入）
+        if run is not None:
+            eid = getattr(run.get("event"), "event_id", None)
+            if eid:
+                self._run_inject_count.pop(eid, None)
         items = self._pending_inject.pop(sid, None)
         if not items:
             return
@@ -646,7 +672,9 @@ class MidflightMessagePlugin(BasePlugin):
 
     def _restore_pending_silent(self, sid: str):
         """同步兜底还原（不 flush）：用于心跳超时等无法 await 的场景，
-        消息回到 buffer，等聊天插件下一次防抖/合并自然带出。"""
+        消息回到 buffer，等聊天插件下一次防抖/合并自然带出。
+        还原 pending = 本轮插话窗口结束，等待计数一并清零。"""
+        self._wait_steps.pop(sid, None)
         items = self._pending_inject.pop(sid, None)
         if not items:
             return

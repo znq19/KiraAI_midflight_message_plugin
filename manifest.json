@@ -1,7 +1,7 @@
 {
   "plugin_id": "midflight_message_plugin",
   "display_name": "随时插话（Midflight）",
-  "version": "1.2.7",
+  "version": "1.2.8",
   "author": "znq19",
   "description": "连续步数消息流入：bot 连续干活时也能随时跟她沟通和聊天，消息不等下一轮，马上被看到，说“停”就停。",
   "repo": "https://github.com/znq19/KiraAI_midflight_message_plugin",
