@@ -14,7 +14,7 @@ from pathlib import Path
 TESTS = Path(__file__).resolve().parent
 
 SUITES = ["test_phantom_run.py", "test_scenarios.py", "test_stuck_paths.py",
-          "test_foreign_event.py", "test_system_event.py"]
+          "test_foreign_event.py", "test_system_event.py", "test_inject_count.py"]
 
 
 def main():

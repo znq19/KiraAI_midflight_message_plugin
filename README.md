@@ -186,6 +186,11 @@ bot:  （下一个工具边界即停止后续步骤，已完成的部分保留�
 <details>
 <summary><b>更新日志</b>（点击展开）</summary>
 
+### v1.3.3
+
+- **修复 `_run_inject_count` 类型混用导致的工具边界异常**：v1.3.2 把该表改为 `(计数, 时间戳)` 元组时漏改了实际注入写点（仍写纯 int），后续每个工具边界都会在两处炸出 `TypeError`（`_gc` 解包 `(_, ts)` 失败 / 读取端 `.get(...)[0]` 对 int 取下标失败），日志表现为反复出现 `on_tool_result 处理异常（已自捕获，不影响主流程）`——虽被自捕获不致崩，但该边界的消息注入与注入配额统计随之失效。现写点改为 `(used + len(injectable), now)` 成对写入，并加注释钉死约束；类型标注同步修正为 `dict[str, tuple[int, float]]`。新增回归测试 `tests/test_inject_count.py`
+- 版本 v1.3.2 → v1.3.3
+
 ### v1.3.2
 
 - **修复「S版私聊主动回复 / 定时任务撞上在飞轮时被转入流入队列」**：S版的私聊主动回复（sender=`system_proactive_dm`）与定时任务（`system_scheduled`）会构造 `is_mentioned=True` 的合成事件走正常消息链；若此时该会话有轮在飞，批次守卫会把这批系统提示词拦截转入流入队列——**原计划的新一轮 LLM 请求消失，工具黑名单（`filter_proactive_tools`）也不再生效**。现批次过滤循环对 `sender.user_id` 以 `system_` 开头的消息（含官方 `system_message`）**既不判停止词也不转注入，原样留在批次里放行**，系统触发照常开新轮。新增回归测试 `tests/test_system_event.py`（6 场景）

@@ -182,8 +182,8 @@ class MidflightMessagePlugin(BasePlugin):
         # ---- 运行时状态（terminate 全部清理）----
         # {sid: {message_id: consumed_ts}}
         self._consumed: dict[str, dict[str, float]] = {}
-        # {event_id(一轮 agent 执行): 已注入条数}
-        self._run_inject_count: dict[str, int] = {}
+        # {event_id(一轮 agent 执行): (已注入条数, 最后更新时间戳)}
+        self._run_inject_count: dict[str, tuple[int, float]] = {}
         # {sid: 有候选消息但未被消费的连续工具边界数}
         self._wait_steps: dict[str, int] = {}
         # {sid: {"event": 运行中的批次事件对象, "ts": 最近心跳, "ending": 末步标记}}
@@ -505,7 +505,9 @@ class MidflightMessagePlugin(BasePlugin):
             key = self._dedup_key(getattr(m, "message", None))
             if key:
                 consumed_map[key] = now
-        self._run_inject_count[run_id] = used + len(injectable)
+        # 计数与心跳成对写入：_gc 按 ts 淘汰、读取端按 [0] 取计数，
+        # 任何写纯 int 的旁路都会让两处同时炸掉（v1.3.2 回归事故）
+        self._run_inject_count[run_id] = (used + len(injectable), now)
         self._wait_steps.pop(sid, None)
 
         base = getattr(tool_result, "text", "") or ""
