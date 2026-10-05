@@ -126,6 +126,16 @@ class MidflightMessagePlugin(BasePlugin):
         # 想让这两条也快速自愈（≈2×grace，而不是 180s）时再打开，取值 ≥ 你环境里
         # 最慢的一次"LLM 调用 + 工具执行"耗时。
         self.inject_grace_seconds = self._to_int(basic.get("inject_grace_seconds", 0), 0)
+        # 幽灵轮清扫器（**默认 12s，常驻开启**）：定期检查「跟踪中的那轮事件」的
+        # is_stopped。为什么需要它：核心的 ON_FINAL_RESULT 派发循环是
+        # 「每个 handler 执行后检查 event.is_stopped 就 break」
+        # （core/message_manager.py），若本轮在更早的阶段（如跨会话 handoff 在
+        # ON_STEP_RESULT）被别的插件 stop，第一个 final_result handler 跑完就
+        # break —— 本插件的收尾 handler（MEDIUM，排在 S版 HIGH 之后）根本轮不到，
+        # 留下幽灵运行中：此后该会话的消息全被拦截进流入队列，却永远等不到工具
+        # 边界。is_stopped 是对事件对象的**确定性判断**（不是看门狗那种挂钟猜测），
+        # 真运行中的轮恒为 False，绝不会误伤。0 = 关闭（不建议）。
+        self.sweeper_interval = self._to_int(basic.get("sweeper_interval", 12), 12)
         # 触发型系统事件放行（默认关 = 照常注入判定，但 notice_skip_stop 默认开
         # 时仍不触发停止词）：开启后 sender.user_id ∈ SYSTEM_SENDER_IDS 或以
         # system_ 开头的消息在运行中拦截时不判停止词、
@@ -200,6 +210,8 @@ class MidflightMessagePlugin(BasePlugin):
         self._bypass: dict[str, float] = {}
         # 流入队列看门狗任务
         self._watchdog_task = None
+        # 幽灵轮清扫器任务
+        self._sweeper_task = None
         # 看门狗两段式放行：
         #   {sid: 软放行次数}；{sid: 软放行时刻} —— 软放行只放行消息、保留运行中状态，
         #   再过 grace 秒仍毫无活动（期间任何 LLM 响应/工具边界都会清零，见
@@ -272,9 +284,11 @@ class MidflightMessagePlugin(BasePlugin):
             f"poke={self.accept_poke} 停止词={'开' if self.stop_enabled else '关(默认)'} "
             f"上限={self._eff_max_inject} 新鲜度={self._eff_freshness}s "
             f"引导语={'开' if self.inject_hint else '关'} "
-            f"看门狗={'关' if self.inject_grace_seconds <= 0 else str(self.inject_grace_seconds) + 's'}"
+            f"看门狗={'关' if self.inject_grace_seconds <= 0 else str(self.inject_grace_seconds) + 's'} "
+            f"幽灵清扫={'关' if self.sweeper_interval <= 0 else str(self.sweeper_interval) + 's'}"
         )
         self._ensure_watchdog()
+        self._ensure_sweeper()
 
     def _ensure_watchdog(self):
         """启动流入队列看门狗（幂等，可重入）。"""
@@ -288,12 +302,29 @@ class MidflightMessagePlugin(BasePlugin):
             logger.warning(f"[Midflight] 流入看门狗启动失败（不影响插件其余功能）: {e}")
             self._watchdog_task = None
 
+    def _ensure_sweeper(self):
+        """启动幽灵轮清扫器（幂等，可重入）。sweeper_interval<=0 时不启动。"""
+        if self.sweeper_interval <= 0:
+            return
+        try:
+            if self._sweeper_task is None or self._sweeper_task.done():
+                self._sweeper_task = asyncio.create_task(self._sweeper_loop())
+        except Exception as e:
+            logger.warning(f"[Midflight] 幽灵清扫器启动失败（不影响插件其余功能）: {e}")
+            self._sweeper_task = None
+
     async def terminate(self):
         """可重入：清理全部运行时状态。"""
         try:
             if self._watchdog_task is not None and not self._watchdog_task.done():
                 self._watchdog_task.cancel()
             self._watchdog_task = None
+        except Exception:
+            pass
+        try:
+            if self._sweeper_task is not None and not self._sweeper_task.done():
+                self._sweeper_task.cancel()
+            self._sweeper_task = None
         except Exception:
             pass
         try:
@@ -346,6 +377,13 @@ class MidflightMessagePlugin(BasePlugin):
         # 不会再被模型读到的工具结果），也不能重建“运行中”标记（幽灵状态）
         run = self._touch_run(sid, event)
         if run is None:
+            return
+
+        # 幽灵轮即时收尾：工具边界到达说明本轮还在跑，但若事件已被 stop
+        # （例如高优先级 tool_result handler 掐停），核心不会再推进本轮，
+        # 注入进工具结果也永远不会被模型读到 —— 直接收尾还原。
+        if self._is_run_event_stopped(run):
+            await self._finish_stopped_run(sid, run)
             return
 
         # 末步标记（最后一步仍带工具调用）：本边界之后不会再有 LLM 调用，
@@ -592,11 +630,13 @@ class MidflightMessagePlugin(BasePlugin):
     async def _on_final_result(self, event, final_result=None, *_):
         """ON_FINAL_RESULT（框架 v2.34.4 起真正派发）＝「一轮 agent 执行结束」的权威信号。
 
-        框架在 agent 循环结束、消息已发出、记忆尚未写入时派发一次；**本轮被 stop 也照样
-        派发**（handler 循环之外）。因此它能覆盖 `_ensure_stop_checkpoint` 覆盖不到的缝：
-        在 ON_LLM_RESPONSE / ON_STEP_RESULT 阶段被别的插件 stop 时，框架的 handler 循环
-        会 `break`，本插件的收尾 handler（优先级 0，排在 S/Z 的 50 之后）可能根本没执行，
-        运行中标记就会残留 → 之后该会话的消息全被拦截。
+        框架在 agent 循环结束、消息已发出、记忆尚未写入时派发一次。⚠️ 但核心的派发
+        循环是「每个 handler 执行后检查 event.is_stopped 就 break」
+        （core/message_manager.py）：本轮若在更早阶段（如跨会话 handoff 在
+        ON_STEP_RESULT）已被 stop，排在前面的 handler 跑完就 break，本 handler
+        （MEDIUM=0，在 S版 HIGH=50 之后）**可能根本轮不到执行**。所以本钩子只是
+        「能到就到」的快路径；真正的兜底是常驻幽灵清扫器 + 各入口的 is_stopped
+        即时检查（见 _sweep_once / on_batch_dedup / _handle_tool_result）。
 
         只在「事件对象就是本插件跟踪的那一轮」时收尾；外来事件（第三方桩事件）不响应。
         框架在批次于 ON_IM_BATCH_MESSAGE / ON_LLM_REQUEST 阶段就被 return 时**不派发**
@@ -677,6 +717,14 @@ class MidflightMessagePlugin(BasePlugin):
                     return
 
             # 2) 运行中批次拦截
+            # 幽灵轮即时收尾：跟踪中的那轮事件已被 stop（如跨会话 handoff 在
+            # ON_STEP_RESULT 掐停；核心的 ON_FINAL_RESULT 循环遇 is_stopped 会
+            # break，本插件的收尾 handler 可能轮不到执行）——不拦截本条消息，
+            # 当场收尾（含还原流入队列并 flush），然后按空闲放行。
+            ghost = self._run_active.get(sid)
+            if ghost is not None and self._is_run_event_stopped(ghost):
+                await self._finish_stopped_run(sid, ghost)
+
             run = self._get_active_run(sid)
             if run is None:
                 # 空闲：放行。运行开始的标记在 ON_LLM_REQUEST 做（批次被
@@ -818,6 +866,36 @@ class MidflightMessagePlugin(BasePlugin):
         self._note_activity(sid)
         return run
 
+    @staticmethod
+    def _is_run_event_stopped(run) -> bool:
+        """跟踪中的那轮事件是否已被 stop。is_stopped 是对事件对象的确定性判断
+        （单向置位、不复位），真运行中的轮恒为 False —— 绝不会误伤在飞的轮。"""
+        try:
+            return bool(getattr(run.get("event"), "is_stopped", False))
+        except Exception:
+            return False
+
+    async def _finish_stopped_run(self, sid: str, run) -> None:
+        """跟踪的那一轮事件已被 stop（跨会话 handoff / 其它插件拦截 / 异常吞没）：
+        立即收尾，不等任何收尾钩子。
+
+        背景：核心的 ON_FINAL_RESULT 派发循环是「每个 handler 执行后检查
+        event.is_stopped 就 break」（core/message_manager.py）。本轮若在更早的
+        阶段已被 stop，排在 S版（HIGH=50）之后的本插件收尾 handler（MEDIUM=0）
+        根本轮不到 → 幽灵运行中 → 之后该会话的消息全被拦截进流入队列，却永远
+        等不到工具边界（只能等 ~180s 心跳兜底，且超时还原原本不 flush）。
+        事件对象就在 run 里，is_stopped 是确定信号，这里当场收尾：
+        清标记（立墓碑）+ 还原流入队列并 flush + 顺手释放 QueueMerge inflight。
+        """
+        eid = getattr(run.get("event"), "event_id", None)
+        logger.info(
+            f"[Midflight] {sid} 跟踪的那一轮（{eid}）事件已被 stop，"
+            f"立即收尾（不等收尾钩子）"
+        )
+        if eid:
+            self._release_queue_merge(sid, eid)
+        await self._finish_run(sid)
+
     def _get_active_run(self, sid: str):
         """取该 sid 的运行中状态；超过活动超时视为已结束（异常路径兜底）。"""
         run = self._run_active.get(sid)
@@ -825,11 +903,53 @@ class MidflightMessagePlugin(BasePlugin):
             return None
         if time.time() - float(run.get("ts", 0)) > self._active_timeout:
             self._log_debug(f"{sid} 运行心跳超 {self._active_timeout}s 未更新，判定已结束")
-            self._run_active.pop(sid, None)
-            self._restore_pending_silent(sid)
-            self._wait_steps.pop(sid, None)
+            self._expire_run(sid, run)
             return None
         return run
+
+    def _expire_run(self, sid: str, run) -> None:
+        """心跳超时兜底（同步部分）：清运行中标记（立墓碑 + 释放 QueueMerge），
+        并把拦截来的待注入消息标记 _bypass 后还原回 buffer **主动 flush**
+        （异步调度；无事件循环时退化为不 flush 的静默还原）。
+
+        旧实现走 _restore_pending_silent（不 flush）：消息回了 buffer 但要等
+        聊天插件下一次防抖/合并才带得出 —— 用户不再发消息就等于无限挂起。
+        """
+        self._run_active.pop(sid, None)
+        self._wait_steps.pop(sid, None)
+        eid = getattr(run.get("event"), "event_id", None)
+        if eid:
+            self._finished_run[sid] = eid
+            self._run_inject_count.pop(eid, None)
+            self._release_queue_merge(sid, eid)
+        items = self._pending_inject.pop(sid, None) or []
+        if not items:
+            return
+        now = time.time()
+        shims = []
+        for it in items:
+            try:
+                key = self._dedup_key(getattr(it[0], "message", None))
+                if key:
+                    self._bypass[key] = now
+            except Exception:
+                pass
+            shims.append(it[0])
+        logger.info(
+            f"[Midflight] {sid} 运行心跳超时，{len(shims)} 条拦截消息还原走正常管线"
+        )
+        try:
+            asyncio.get_running_loop().create_task(
+                self._restore_to_buffer(sid, shims, flush=True)
+            )
+        except RuntimeError:
+            # 没有运行中的事件循环（不应发生：所有调用点都在 async handler 里）
+            try:
+                buffer = self.ctx.get_buffer(sid)
+                if buffer is not None:
+                    buffer.buffer[:0] = shims
+            except Exception:
+                logger.exception("[Midflight] 超时还原消息异常（已自捕获）")
 
     async def _finish_run(self, sid: str):
         """一轮结束：清标记，并把批次拦截来的待注入消息还原回 buffer 后主动 flush，
@@ -887,10 +1007,14 @@ class MidflightMessagePlugin(BasePlugin):
 
     # ============ 流入队列看门狗 ============
     #
-    # 为什么需要它：本插件靠"工具边界 + 末步标记"推断一轮的结束，但框架并**没有**
-    # 一个"本轮结束"的钩子（ON_FINAL_RESULT 在框架里从未派发，已核实）。以下情况
-    # 都会让收尾信号永远不来，留下"幽灵运行中"：
-    #   · 本轮被别的插件在 ON_LLM_REQUEST / ON_STEP_RESULT 阶段 stop（本轮根本没跑起来）；
+    # 为什么需要它：本插件靠"工具边界 + 末步标记 + ON_FINAL_RESULT"推断一轮的结束。
+    # ON_FINAL_RESULT 自框架 v2.34.4 起真实派发，但它的循环是「每个 handler 后检查
+    # is_stopped 就 break」（core/message_manager.py）——本轮若在更早阶段被 stop，
+    # 低优先级的收尾 handler 轮不到执行。以下情况都会让收尾信号永远不来，
+    # 留下"幽灵运行中"：
+    #   · 本轮被别的插件在 ON_LLM_REQUEST / ON_STEP_RESULT 阶段 stop；
+    #   · 上述 ON_FINAL_RESULT 的 break（跨会话 handoff 就是这条，v1.3.4 起由
+    #     常驻幽灵清扫器 + 各入口 is_stopped 即时检查覆盖，不再依赖本看门狗）；
     #   · 运行中途抛异常被 event bus 静默吞掉（handle_im_batch_message 外层无 try）；
     #   · 最后一步的工具调用全部被 max_tool_calls_per_turn 跳过（一个 ON_TOOL_RESULT 都没有）；
     #   · 插件自身 bug / 未来框架行为变化。
@@ -898,6 +1022,44 @@ class MidflightMessagePlugin(BasePlugin):
     # 只能等"运行中判定超时"（LLM 超时 + 工具超时，默认 180s）兜底 —— 对只有 1~2 步的
     # 用户尤其明显（一轮只有几秒，兜底窗口却是 180 秒，长两个数量级）。
     # 看门狗就是"搭不上车就别硬搭"：等待超过 inject_grace_seconds 就还原走正常管线。
+
+    # ============ 幽灵轮清扫器（常驻） ============
+
+    async def _sweeper_loop(self):
+        """常驻清扫：定期检查跟踪中的轮次事件是否已被 stop，是则立即收尾。
+
+        与看门狗的区别：看门狗是挂钟猜测（怕误伤慢轮，默认关）；清扫器只看
+        事件对象的 is_stopped（单向置位的确定信号），真运行中的轮恒为 False，
+        可以常驻、可以快。循环体单独抽成 _sweep_once 便于测试直接驱动。
+        """
+        try:
+            while True:
+                interval = float(self.sweeper_interval or 0)
+                await asyncio.sleep(max(2.0, interval) if interval > 0 else 5.0)
+                if interval <= 0:
+                    continue
+                try:
+                    await self._sweep_once()
+                    self._gc()
+                except Exception:
+                    # 单轮异常绝不能杀死清扫器——它是幽灵轮的最终保险丝
+                    logger.exception("[Midflight] 幽灵清扫单轮异常（已自捕获，继续运行）")
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            logger.exception("[Midflight] 幽灵清扫器异常（已自捕获）")
+
+    async def _sweep_once(self) -> int:
+        """扫一遍 _run_active：事件已 stop 的轮立即收尾。返回清扫的轮数。"""
+        swept = 0
+        for sid, run in list(self._run_active.items()):
+            try:
+                if self._is_run_event_stopped(run):
+                    await self._finish_stopped_run(sid, run)
+                    swept += 1
+            except Exception:
+                logger.exception(f"[Midflight] 清扫 {sid} 异常（已自捕获）")
+        return swept
 
     async def _watchdog_loop(self):
         try:
