@@ -187,6 +187,13 @@ bot:  （下一个工具边界即停止后续步骤，已完成的部分保留�
 <details>
 <summary><b>更新日志</b>（点击展开）</summary>
 
+### v1.3.5
+
+- **修复 3.0 框架上「拦截消息还原后 flush 失败」（线上实测复现）**：批次拦截路径用 `_BufferedMsgShim` 把批次消息包装成 buffer 事件形状，还原回 SessionBuffer 后由框架 `flush_session_messages` 重新成批——但 shim 只暴露了旧字段名 `message_types`，而 **3.0（dev-v3）的 `core/message_manager.py` 改读 `last_event.supported_elements`**（字段改名），shim 作为缓冲里最后一条事件时直接 `AttributeError`，日志表现为 `还原消息回 buffer 异常（已自捕获）`。消息在异常前已放回 buffer（**不丢**），但 flush 没执行——用户不再说话就一直滞留，等不到下一轮。2.x 读的是 `message_types`，不受影响。修复：shim 构造时**先取新名 `supported_elements`、回退旧名 `message_types`，两个名字都暴露**——2.x / 3.0 的 flush 都能读到，且 3.0 上不再触碰 deprecated 别名
+- **顺带消除 3.0 的 DeprecationWarning 刷屏**：原来每个被拦截的批次都会经 `message_types` 的 `@deprecated` property 别名刷一条 `message_types is deprecated; use supported_elements instead`；改成先取新名后，3.0 上零警告（2.x 上 `supported_elements` 不存在，`getattr` 直接拿默认值，同样无警告）
+- 新增回归测试 `tests/test_restore_flush_compat.py`（6 断言：3.0 拦截全程零警告 / 3.0 还原+flush 成批且 `supported_elements` 透传 / 消息逐条一致 / 2.x 同流程不回归 / **反向验证**旧 shim 形状必炸 3.0 flush / shim 双名共存同值），并用真实双世代核心（v2.34.8 + dev-v3）冒烟验证
+- 版本 v1.3.4 → v1.3.5
+
 ### v1.3.4
 
 - **修复「跨会话 handoff 后私聊被幽灵挂死」（线上实测复现）**：会话合并插件（session_merger）的跨会话交棒会在 **ON_STEP_RESULT 阶段** stop 当前轮；核心的 ON_FINAL_RESULT 派发循环是「每个 handler 执行后检查 `event.is_stopped` 就 break」（`core/message_manager.py`）——事件在进入 final_result 循环**之前**就已是 stopped，排在最前的 S版 handler（HIGH=50）跑完即 break，本插件的收尾 handler（MEDIUM=0）**根本轮不到执行**，`_run_active` 残留成「幽灵运行中」：此后该会话的消息全被拦截进流入队列，而那一轮已经死了、永远不会再有工具边界来注入，只能等 ~180 秒心跳超时，且超时还原原本**不 flush**——用户不再发消息就无限挂起（线上日志：`拦截运行中批次 … 1 条转入流入队列` 后私聊再无响应）
