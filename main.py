@@ -84,14 +84,31 @@ OVERRIDABLE_KEYS = {
 
 class _BufferedMsgShim:
     """把批次里的 KiraIMMessage 包装成与 buffer 中 KiraMessageEvent 相同的访问形状
-    （.message / .is_group_message() / .message_types / .adapter / .session），
-    使批次拦截路径与 buffer drain 路径可以走完全相同的过滤与注入代码。"""
+    （.message / .is_group_message() / .message_types / .supported_elements /
+    .adapter / .session），使批次拦截路径与 buffer drain 路径可以走完全相同的
+    过滤与注入代码。
 
-    __slots__ = ("message", "message_types", "adapter", "session", "_is_group")
+    ⚠ 双世代字段名：框架把 shim 还原进 SessionBuffer 后，flush_session_messages
+    会读缓冲里最后一条事件的消息类型集合来构造新批次——
+      · 2.x  读 last_event.message_types       （core/message_manager.py）
+      · 3.0  读 last_event.supported_elements  （同文件，字段改名）
+    两个名字都必须存在，缺哪个哪代炸（3.0 缺 supported_elements 时
+    AttributeError: 还原的消息滞留在 buffer 里 flush 不出去）。"""
+
+    __slots__ = ("message", "message_types", "supported_elements",
+                 "adapter", "session", "_is_group")
 
     def __init__(self, message, batch_event):
         self.message = message
-        self.message_types = getattr(batch_event, "message_types", None)
+        # 先取新名（3.0 的 supported_elements）再回退旧名（2.x 的 message_types）：
+        # 3.0 上 message_types 是带 @deprecated 的 property 别名，直接读会刷
+        # DeprecationWarning；2.x 上 supported_elements 不存在，getattr 直接拿
+        # 默认值（不抛异常、无警告）。顺序反过来则两代总有一代要踩别名。
+        types = getattr(batch_event, "supported_elements", None)
+        if types is None:
+            types = getattr(batch_event, "message_types", None)
+        self.message_types = types        # 2.x 框架 flush 读取
+        self.supported_elements = types   # 3.0 框架 flush 读取
         self.adapter = getattr(batch_event, "adapter", None)
         self.session = getattr(batch_event, "session", None)
         try:
