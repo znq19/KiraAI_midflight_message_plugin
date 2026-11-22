@@ -187,6 +187,12 @@ bot:  （下一个工具边界即停止后续步骤，已完成的部分保留�
 <details>
 <summary><b>更新日志</b>（点击展开）</summary>
 
+### v1.3.7
+
+- **静态兜底格式化器对齐 3.3.0**：拿不到 `kira-ai` 插件实例时，复刻的消息头现在会同时输出 `user_nickname` 与 `group_nickname`（两者相同则去重），私聊不输出群名片；名字压单行，含 `[` / `]` 时方括号与 `|` 转全角，防止名片换行或 `]|` 伪造新行。
+- 自定义模板新增 `{group_nickname}` 变量（原变量全部保留）。
+- 新增 `tests/test_format_fallback.py` 6 项，已加入 `tests/run_tests.py`。
+
 ### v1.3.6
 
 - **3.0 兼容：buffer 路径消息文本化双形态化**——3.0 起 `MessageProcessor.message_format_to_text` 已移除（格式化职责迁到 `MessageFormatter` 服务），旧调用被外层 except 吞掉，buffer 路径的流入消息静默丢失渲染结果（媒体 caption 等）。现逐级探测 3.0 格式化服务（`MessageFormatter.format_to_text`，异步），探测不到回退 2.x 路径；2.x 探测链返回空走原路径，行为零变化

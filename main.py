@@ -82,6 +82,14 @@ OVERRIDABLE_KEYS = {
 }
 
 
+def _safe_display_name(value) -> str:
+    """单行化显示名；名字里带方括号时把结构字符转全角，防止伪造消息头。"""
+    s = " ".join(str(value or "").split())
+    if "[" in s or "]" in s:
+        s = s.replace("[", "［").replace("]", "］").replace("|", "｜")
+    return s
+
+
 class _BufferedMsgShim:
     """把批次里的 KiraIMMessage 包装成与 buffer 中 KiraMessageEvent 相同的访问形状
     （.message / .is_group_message() / .message_types / .supported_elements /
@@ -1525,6 +1533,7 @@ class MidflightMessagePlugin(BasePlugin):
             mid = getattr(message, "message_id", "")
             sender = getattr(message, "sender", None)
             nick = getattr(sender, "nickname", "") if sender else ""
+            nick = _safe_display_name(nick)
             uid = getattr(sender, "user_id", "") if sender else ""
             is_notice = bool(getattr(message, "is_notice", False))
             try:
@@ -1536,27 +1545,35 @@ class MidflightMessagePlugin(BasePlugin):
                     is_group = getattr(message, "group", None) is not None
             if is_group:
                 group = getattr(message, "group", None)
-                gn = getattr(group, "group_name", "") if group else ""
+                gn = _safe_display_name(getattr(group, "group_name", "")) if group else ""
                 gid = getattr(group, "group_id", "") if group else ""
+                raw_card = getattr(sender, "group_nickname", None) if sender else None
+                card = _safe_display_name(raw_card)
                 if is_notice:
                     return f"[{date_str}] Notice [group_id: {gid}, user_id: {uid}] | {text}"
+                card_part = f", group_nickname: {card}" if card and card != nick else ""
                 return (f"[{date_str}] [message_id: {mid}] "
                         f"[group_name: {gn} group_id: {gid} "
-                        f"user_nickname: {nick}, user_id: {uid}] | {text}")
+                        f"user_nickname: {nick or 'None'}{card_part}, user_id: {uid}] | {text}")
             if is_notice:
                 return f"[{date_str}] Notice [user_id: {uid}] | {text}"
-            return f"[{date_str}] [message_id: {mid}] [user_nickname: {nick}, user_id: {uid}] | {text}"
+            return f"[{date_str}] [message_id: {mid}] [user_nickname: {nick or 'None'}, user_id: {uid}] | {text}"
         except Exception:
             return text
 
     def _render_template(self, template: str, msg_event, text: str, n: int) -> str:
         message = getattr(msg_event, "message", None)
-        nickname = str(getattr(getattr(message, "sender", None), "nickname", "") or "")
+        nickname = _safe_display_name(getattr(getattr(message, "sender", None), "nickname", ""))
         user_id = str(getattr(getattr(message, "sender", None), "user_id", "") or "")
         message_id = str(getattr(message, "message_id", "") or "")
         group = getattr(message, "group", None)
-        group_name = str(getattr(group, "group_name", "") or "") if group else ""
+        group_name = _safe_display_name(getattr(group, "group_name", "")) if group else ""
         group_id = str(getattr(group, "group_id", "") or "") if group else ""
+        group_nickname = ""
+        if group is not None:
+            raw_card = getattr(getattr(message, "sender", None), "group_nickname", None)
+            if isinstance(raw_card, str):
+                group_nickname = _safe_display_name(raw_card)
         ts = getattr(message, "timestamp", 0) or 0
         try:
             time_str = time.strftime("%H:%M:%S", time.localtime(float(ts)))
@@ -1566,7 +1583,8 @@ class MidflightMessagePlugin(BasePlugin):
             return template.format(
                 sender_nickname=nickname, text=text, time=time_str, n=n,
                 user_id=user_id, message_id=message_id,
-                group_name=group_name, group_id=group_id)
+                group_name=group_name, group_id=group_id,
+                group_nickname=group_nickname)
         except Exception:
             return text
 

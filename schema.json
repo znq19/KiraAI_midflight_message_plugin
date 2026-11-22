@@ -184,7 +184,7 @@
         "type": "textarea",
         "default": "",
         "name": "自定义注入模板",
-        "hint": "默认留空 = 使用与平时聊天完全一致的官方格式（[时间] [message_id: x] [user_nickname: x, user_id: x] | 内容，群聊另带群名/群号），bot 感知不到差别。仅高级用户自定义，可用变量 {sender_nickname} {user_id} {message_id} {group_name} {group_id} {text} {time} {n}。"
+        "hint": "默认留空 = 使用与平时聊天完全一致的官方格式（[时间] [message_id: x] [user_nickname: x, group_nickname: x, user_id: x] | 内容，群聊另带群名/群号），bot 感知不到差别。仅高级用户自定义，可用变量 {sender_nickname} {group_nickname} {user_id} {message_id} {group_name} {group_id} {text} {time} {n}。"
       },
       "inject_hint": {
         "type": "switch",
