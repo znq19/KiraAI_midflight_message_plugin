@@ -201,8 +201,15 @@ async def case_system_trigger_a(path):
     b = H.batch(m)
     await p.on_batch_dedup(b)
     assert not b.is_stopped and not ctx.steer_calls, (b.is_stopped, ctx.steer_calls)
+    # 混合批次：system trigger 必须整批放行，不能被普通消息截走
+    m2 = H.FakeMessage("272", "普通")
+    b2 = H.batch(m, m2)
+    await p.on_batch_dedup(b2)
+    assert not b2.is_stopped and not ctx.steer_calls, (b2.is_stopped, ctx.steer_calls)
+    assert not p._pending_inject.get(SID), p._pending_inject
     await p.terminate()
-    return {"system trigger A: false→steer": True, "true→放行": True}
+    return {"system trigger A: false→steer": True, "true→放行": True,
+            "混合批次保留系统消息": True}
 
 
 async def case_media_and_notice(path):

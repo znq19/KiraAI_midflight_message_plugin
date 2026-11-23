@@ -988,6 +988,7 @@ class MidflightMessagePlugin(BasePlugin):
             cfg = self._eff_config(sid)
             now = time.time()
             stop_hit, injectable, rejected = [], [], []
+            passthrough_system = []
             for m in messages:
                 # ① 触发型系统事件放行（system_trigger_passthrough，默认关=照常注入判定）：
                 # 开启后 S版主动回复/定时任务等 system_* sender 的消息既不判停止词也
@@ -995,6 +996,7 @@ class MidflightMessagePlugin(BasePlugin):
                 # 消息：批次原样放行"路径，系统提示词照常开新轮（新轮请求与工具
                 # 黑名单语义完整保留）
                 if cfg["system_trigger_passthrough"] and self._is_system_sender(m):
+                    passthrough_system.append(m)
                     continue
                 shim = _BufferedMsgShim(m, event)
                 try:
@@ -1016,6 +1018,14 @@ class MidflightMessagePlugin(BasePlugin):
                 except Exception:
                     rejected.append(shim)
                     logger.exception("[Midflight] 批次消息过滤异常，已放回原流程")
+
+            if passthrough_system:
+                if not stop_hit:
+                    # 整批放行：保留 system trigger 的新轮/工具黑名单语义，
+                    # 不让同一批里的普通消息把系统消息截走。
+                    return
+                # 有停止词时仍执行停止；系统消息转入轮末队列，下一轮继续处理
+                rejected.extend(passthrough_system)
 
             if not stop_hit and not injectable:
                 return  # 没有要消费的消息：批次原样放行给 QueueMerge / 官方
