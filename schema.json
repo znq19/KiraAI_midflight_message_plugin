@@ -149,11 +149,17 @@
     "name": "数量与时间窗口",
     "collapsed": true,
     "fields": {
+      "max_inject_per_step": {
+        "type": "integer",
+        "default": 0,
+        "name": "每步最多流入条数",
+        "hint": "0 = 自动读取配置里的最大消息缓冲条数（bot_config.bot.max_buffer_messages）；-1 = 每步无限制。每个 agent step 独立计数，同一步的多个工具调用共享这一份；只有真正注入的消息消耗配额，被过滤掉的消息不算。"
+      },
       "max_inject_per_run": {
         "type": "integer",
         "default": 0,
-        "name": "单轮最多流入条数",
-        "hint": "0 = 自动读取配置里的最大消息缓冲条数（bot_config.bot.max_buffer_messages）。达到上限后，后续消息按原样留给聊天插件开新轮。"
+        "name": "整轮安全上限",
+        "hint": "0 = 自动按「每步上限 × 最大工具循环数（bot_config.agent.max_tool_loop）」实时计算；-1 = 整轮无限制。达到上限后，后续消息留给聊天插件开新轮，不再卡在缓冲里。"
       },
       "freshness_seconds": {
         "type": "integer",

@@ -20,6 +20,8 @@
 
 import asyncio
 import fnmatch
+import json
+import math
 import re
 import time
 from datetime import datetime
@@ -75,6 +77,7 @@ OVERRIDABLE_KEYS = {
     "wake_keywords", "stop_enabled", "stop_words", "stop_match_mode",
     "stop_whitelist_enabled", "stop_whitelist_users",
     "whitelist_enabled", "whitelist_users", "max_inject_per_run",
+    "max_inject_per_step",
     "freshness_seconds", "max_length", "block_patterns", "template",
     "inject_hint", "inject_hint_text", "inject_timeout_steps",
     "inject_grace_seconds", "debug",
@@ -134,6 +137,7 @@ class MidflightMessagePlugin(BasePlugin):
     def __init__(self, ctx, cfg: dict):
         super().__init__(ctx, cfg)
         cfg = cfg or {}
+        cfg = self._migrate_config(cfg)
 
         basic = cfg.get("section_basic", {}) or {}
         self.enabled = bool(basic.get("enabled", True))
@@ -193,6 +197,9 @@ class MidflightMessagePlugin(BasePlugin):
         self.whitelist_users = [str(u) for u in (scope.get("whitelist_users") or []) if str(u).strip()]
 
         limits = cfg.get("section_limits", {}) or {}
+        if isinstance(limits, dict) and isinstance(limits.get("fields"), dict):
+            limits = limits["fields"]
+        self.max_inject_per_step = self._to_int(limits.get("max_inject_per_step", 0), 0)
         self.max_inject_per_run = self._to_int(limits.get("max_inject_per_run", 0), 0)
         self.freshness_seconds = self._to_int(limits.get("freshness_seconds", 0), 0)
         self.max_length = self._to_int(limits.get("max_length", 0), 0)
@@ -219,6 +226,8 @@ class MidflightMessagePlugin(BasePlugin):
         self._consumed: dict[str, dict[str, float]] = {}
         # {event_id(一轮 agent 执行): (已注入条数, 最后更新时间戳)}
         self._run_inject_count: dict[str, tuple[int, float]] = {}
+        # {event_id: (当前 step, 该 step 已注入条数, 最后更新时间戳)}
+        self._run_step_count: dict[str, tuple[int, int, float]] = {}
         # {sid: 有候选消息但未被消费的连续工具边界数}
         self._wait_steps: dict[str, int] = {}
         # {sid: {"event": 运行中的批次事件对象, "ts": 最近心跳, "ending": 末步标记}}
@@ -245,7 +254,8 @@ class MidflightMessagePlugin(BasePlugin):
         self._wd_escalate: dict[str, float] = {}
         # 上次清理时间
         self._last_gc: float = 0.0
-        # 自动解析后的生效值（initialize 中解析）
+        # 自动解析后的生效值（initialize 中解析；自动项在 _eff_config 里实时重算）
+        self._eff_max_inject_per_step: int = 0
         self._eff_max_inject: int = 0
         self._eff_freshness: int = 0
         self._active_timeout: float = FALLBACK_ACTIVE_TIMEOUT
@@ -254,15 +264,13 @@ class MidflightMessagePlugin(BasePlugin):
 
     async def initialize(self):
         """解析自动配置项并记日志；可重入。"""
-        # 单轮最多流入条数：0 = 自动读 bot_config.bot.max_buffer_messages
-        if self.max_inject_per_run <= 0:
-            auto = self._read_core_config("bot_config.bot.max_buffer_messages")
-            self._eff_max_inject = self._to_int(auto, FALLBACK_MAX_INJECT)
-            if self._eff_max_inject <= 0:
-                self._eff_max_inject = FALLBACK_MAX_INJECT
-            self._log_debug(f"max_inject_per_run 自动读取: {self._eff_max_inject}")
-        else:
-            self._eff_max_inject = self.max_inject_per_run
+        # 每步/整轮上限：0 = 自动实时读取，-1 = 无限制
+        self._eff_max_inject_per_step = self._current_max_inject_per_step()
+        self._eff_max_inject = self._current_max_inject_per_run()
+        self._log_debug(
+            f"max_inject_per_step 自动解析: {self._eff_max_inject_per_step}; "
+            f"max_inject_per_run 自动解析: {self._eff_max_inject}"
+        )
 
         # 新鲜度：-1 = 不限（默认；buffer 里的消息本来都是本轮执行期间到达的，
         # 配合 S版/Z版 等带合并防抖的聊天插件时，消息常已在队列里等了十几秒，
@@ -307,7 +315,8 @@ class MidflightMessagePlugin(BasePlugin):
             f"[Midflight] 随时插话 v{self._self_version()} 已加载 | enabled={self.enabled} "
             f"群聊={self.flow_method_group} 私聊={self.flow_method_dm} "
             f"poke={self.accept_poke} 停止词={'开' if self.stop_enabled else '关(默认)'} "
-            f"上限={self._eff_max_inject} 新鲜度={self._eff_freshness}s "
+            f"上限=每步{self._eff_max_inject_per_step}/整轮{self._eff_max_inject} "
+            f"新鲜度={self._eff_freshness}s "
             f"引导语={'开' if self.inject_hint else '关'} "
             f"看门狗={'关' if self.inject_grace_seconds <= 0 else str(self.inject_grace_seconds) + 's'} "
             f"幽灵清扫={'关' if self.sweeper_interval <= 0 else str(self.sweeper_interval) + 's'}"
@@ -352,9 +361,20 @@ class MidflightMessagePlugin(BasePlugin):
             self._sweeper_task = None
         except Exception:
             pass
+        # 卸载/重载前把未注入的拦截消息还原并 flush，避免配置变更/禁用时丢消息
+        # （S/Z 的 merge_scheduler.shutdown 同样会“重发 pending”）
+        for sid, items in list(self._pending_inject.items()):
+            shims = [it[0] for it in items]
+            if not shims:
+                continue
+            try:
+                await self._restore_to_buffer(sid, shims, flush=True)
+            except Exception:
+                logger.exception("[Midflight] 卸载时还原拦截消息异常（已自捕获）")
         try:
             self._consumed.clear()
             self._run_inject_count.clear()
+            self._run_step_count.clear()
             self._wait_steps.clear()
             self._run_active.clear()
             self._finished_run.clear()
@@ -376,6 +396,40 @@ class MidflightMessagePlugin(BasePlugin):
             await self._handle_tool_result(event, tool_result)
         except Exception:
             logger.exception("[Midflight] on_tool_result 处理异常（已自捕获，不影响主流程）")
+
+    def _defer_to_pending(self, sid: str, items, now: float | None = None,
+                          *, front: bool = True) -> None:
+        """把本轮暂不消费的消息放回流入队列，而不是直接放回共享 buffer。
+
+        直接放回 buffer 有一个致命缺口：聊天插件的 debounce 任务在本次 flush
+        后已经 return，本轮结束时若 _pending_inject 为空，_finish_run 不会调用
+        flush_session_messages —— 这些消息就留在 buffer 里，直到用户再发下一条
+        才被带出（用户不发就永远看不到）。放进 _pending_inject 后，轮末一定会走
+        _finish_run 的「还原 + flush」路径，保证它们成为正常的新一轮。
+        """
+        if not items:
+            return
+        now = time.time() if now is None else now
+        normalized = []
+        for item in items:
+            if isinstance(item, tuple):
+                ev = item[0]
+                text = item[1] if len(item) > 1 else ""
+            else:
+                ev, text = item, ""
+            normalized.append((ev, text, now))
+        q = self._pending_inject.setdefault(sid, [])
+        if front:
+            q[:0] = normalized
+        else:
+            q.extend(normalized)
+
+    def _step_used(self, run_id: str, step: int) -> int:
+        """返回该 run 当前 step 已注入的条数；step 变了就是 0。"""
+        state = self._run_step_count.get(run_id)
+        if state and int(state[0]) == int(step):
+            return max(0, int(state[1]))
+        return 0
 
     async def _handle_tool_result(self, event: KiraMessageBatchEvent, tool_result):
         cfg = self._eff_config(None)
@@ -418,6 +472,11 @@ class MidflightMessagePlugin(BasePlugin):
             await self._finish_run(sid)
             return
 
+        # 当前 agent step（1/50 的 1）；同一步多个工具调用共享步配额
+        step = self._to_int(run.get("step", 1), 1)
+        if step <= 0:
+            step = 1
+
         queued = [item[0] for item in self._pending_inject.pop(sid, [])]
 
         buffer = self.ctx.get_buffer(sid)
@@ -429,11 +488,10 @@ class MidflightMessagePlugin(BasePlugin):
         timeout = cfg["inject_timeout_steps"]
         waited = self._wait_steps.get(sid, 0)
         if timeout > 0 and waited >= timeout:
-            if queued and buffer is not None:
-                # 批次拦截来的消息等超了：还原回 buffer 走正常管线，绝不卡住
-                async with buffer.lock:
-                    buffer.buffer[:0] = queued
-                self._log_debug(f"{sid} 拦截消息等待超上限，已还原回 buffer")
+            if queued:
+                # 批次拦截来的消息等超了：放回流入队列，由轮末统一还原 + flush
+                self._defer_to_pending(sid, queued)
+                self._log_debug(f"{sid} 拦截消息等待超上限，已转入轮末还原队列")
             self._log_debug(f"{sid} 候选消息已等待 {waited} 个边界（上限 {timeout}），不再消费")
             # 重置等待计数：本边界放弃消费，但下一边界重新从 0 计数。
             # 若不重置，计数永久停在上限，之后所有新消息（哪怕通过全部过滤）
@@ -490,26 +548,32 @@ class MidflightMessagePlugin(BasePlugin):
                 rejected.append(msg_event)
                 logger.exception("[Midflight] 单条消息过滤异常，已放回原流程")
 
-        # 单轮流入条数上限：超额部分放回 buffer 留给聊天插件开新轮
+        # 每步上限 + 整轮安全上限：超额部分留在流入队列，下一 step 重新获得
+        # 步配额；整轮配额用完则轮末统一还原开新轮。
         run_id = getattr(event, "event_id", None) or sid
-        used = self._run_inject_count.get(run_id, (0, now))[0]
-        quota = max(0, cfg["_max_inject"] - used)
+        used_run = self._run_inject_count.get(run_id, (0, now))[0]
+        used_step = self._step_used(run_id, step)
+        step_cap = cfg["_max_inject_per_step"]
+        run_cap = cfg["_max_inject"]
+        step_left = math.inf if step_cap < 0 else max(0, step_cap - used_step)
+        run_left = math.inf if run_cap < 0 else max(0, run_cap - used_run)
+        candidates = len(injectable)
+        if math.isinf(step_left) and math.isinf(run_left):
+            quota = candidates
+        else:
+            quota = max(0, int(min(step_left, run_left)))
         overflow = injectable[quota:]
         injectable = injectable[:quota]
 
-        # 放回未消费的消息（保持原顺序置于 buffer 头部）
-        put_back = rejected + [m for m, _ in overflow]
-        if put_back:
-            async with buffer.lock:
-                buffer.buffer[:0] = put_back
+        # 未消费的消息（未通过过滤 / 超出步或整轮上限）放回流入队列，
+        # 轮末统一还原 + flush；绝不直接丢回共享 buffer 后无人唤醒。
+        self._defer_to_pending(sid, rejected + [m for m, _ in overflow], now)
 
         # 停止与注入互斥：命中停止词只 stop 不注入；
-        # 同批已通过过滤的消息放回 buffer 走官方管线，绝不丢消息
+        # 同批已通过过滤的消息放回流入队列，轮末还原走官方管线，绝不丢消息
         if stop_hit:
             leftover = [m for m, _ in injectable]
-            if leftover:
-                async with buffer.lock:
-                    buffer.buffer[:0] = leftover
+            self._defer_to_pending(sid, leftover, now)
             for m in stop_hit:
                 key = self._dedup_key(getattr(m, "message", None))
                 if key:
@@ -525,8 +589,17 @@ class MidflightMessagePlugin(BasePlugin):
             return
 
         if not injectable:
-            # 有候选但都没消费：累计等待步数
-            self._wait_steps[sid] = waited + 1
+            # 有候选但被步/整轮配额挡住：不累计等待，下一 step 重新拿步配额；
+            # 只有真正全部被过滤（candidates == 0）才累计等待，避免配额阻塞被
+            # inject_timeout_steps 误判成“放弃本轮”。
+            if candidates > 0:
+                self._wait_steps.pop(sid, None)
+                self._log_debug(
+                    f"{sid} step {step} 配额已满（步 {used_step}/{step_cap}，"
+                    f"轮 {used_run}/{run_cap}），{candidates} 条留到下一 step"
+                )
+            else:
+                self._wait_steps[sid] = waited + 1
             return
 
         # 原生样式文本化（与官方批次 message_format_to_text 一致）
@@ -583,7 +656,8 @@ class MidflightMessagePlugin(BasePlugin):
                 consumed_map[key] = now
         # 计数与心跳成对写入：_gc 按 ts 淘汰、读取端按 [0] 取计数，
         # 任何写纯 int 的旁路都会让两处同时炸掉（v1.3.2 回归事故）
-        self._run_inject_count[run_id] = (used + len(injectable), now)
+        self._run_step_count[run_id] = (step, used_step + len(injectable), now)
+        self._run_inject_count[run_id] = (used_run + len(injectable), now)
         self._wait_steps.pop(sid, None)
 
         base = getattr(tool_result, "text", "") or ""
@@ -606,7 +680,11 @@ class MidflightMessagePlugin(BasePlugin):
         except Exception:
             self._log_debug("媒体附件透传失败（已忽略，不影响文本流入）")
 
-        logger.info(f"[Midflight] {sid} 流入 {len(injectable)} 条消息到当前轮")
+        logger.info(
+            f"[Midflight] {sid} 流入 {len(injectable)} 条消息到当前轮"
+            f"（step {step}，步 {used_step + len(injectable)}/{step_cap}，"
+            f"轮 {used_run + len(injectable)}/{run_cap}）"
+        )
 
     # ============ 去重兜底：掐掉完全重复的批次 ============
 
@@ -624,9 +702,17 @@ class MidflightMessagePlugin(BasePlugin):
                 # 新轮开始：旧轮若没收到收尾事件（异常路径），其 pending 消息
                 # 与等待计数会残留并被新轮继承——旧轮消息错注入新轮、新轮
                 # 继承旧轮超限计数。先清理再登记（含旧的“已收尾”记录）。
+                old_run = self._run_active.get(sid)
+                if old_run is not None and old_run.get("event") is not event:
+                    old_eid = getattr(old_run.get("event"), "event_id", None)
+                    if old_eid:
+                        self._run_inject_count.pop(old_eid, None)
+                        self._run_step_count.pop(old_eid, None)
                 self._restore_pending_silent(sid)
                 self._finished_run.pop(sid, None)
-                self._run_active[sid] = {"event": event, "ts": time.time(), "ending": False}
+                self._run_active[sid] = {
+                    "event": event, "ts": time.time(), "ending": False, "step": 1,
+                }
         except Exception:
             pass
 
@@ -654,12 +740,18 @@ class MidflightMessagePlugin(BasePlugin):
                 return
             run["ts"] = time.time()
             self._note_activity(sid)
-            # 末步仍带工具：该步工具执行完 agent 即结束（无最终文本步），
-            # 打标记让下一个工具边界不再注入（注入会丢），直接收尾还原
+            # 记录当前 agent step（1/50 的 1）；step 变化时清掉等待计数，
+            # 让上一步因配额满而留下的消息在下一步重新获得步配额。
             idx = getattr(resp, "agent_step_index", None)
             if idx:
-                max_steps = self._to_int(self._read_core_config("bot_config.agent.max_tool_loop"), 2)
-                if max_steps > 0 and int(idx) >= max_steps:
+                step = max(1, self._to_int(idx, 1))
+                if run.get("step") != step:
+                    run["step"] = step
+                    self._wait_steps.pop(sid, None)
+                # 末步仍带工具：该步工具执行完 agent 即结束（无最终文本步），
+                # 打标记让下一个工具边界不再注入（注入会丢），直接收尾还原
+                max_steps = self._current_max_tool_loop()
+                if max_steps > 0 and step >= max_steps:
                     run["ending"] = True
         except Exception:
             logger.exception("[Midflight] llm_response 处理异常（已自捕获）")
@@ -809,12 +901,11 @@ class MidflightMessagePlugin(BasePlugin):
 
             # 停止与注入互斥（与 drain 路径同一语义）
             consumed_map = self._consumed.setdefault(sid, {})
-            buffer = self.ctx.get_buffer(sid)
             if stop_hit:
-                put_back = rejected + [s for s, _ in injectable]
-                if put_back and buffer is not None:
-                    async with buffer.lock:
-                        buffer.buffer[:0] = put_back
+                # 未消费的（rejected + 本批可注入但被停止互斥留下的）统一转入
+                # 流入队列；_finish_run 会还原 + flush，绝不让它们滞留在 buffer。
+                self._defer_to_pending(
+                    sid, rejected + [s for s, _ in injectable], now, front=False)
                 for s in stop_hit:
                     key = self._dedup_key(getattr(s, "message", None))
                     if key:
@@ -826,10 +917,9 @@ class MidflightMessagePlugin(BasePlugin):
                 await self._finish_run(sid)
                 return
 
-            # 注入：转入待注入队列，下一个工具边界注入
-            if rejected and buffer is not None:
-                async with buffer.lock:
-                    buffer.buffer[:0] = rejected
+            # 注入：未通过过滤的与可注入的一起转入待注入队列；前者会在轮末
+            # 还原走正常管线，后者等下一个工具边界注入。不再直接写共享 buffer。
+            self._defer_to_pending(sid, rejected, now, front=False)
             q = self._pending_inject.setdefault(sid, [])
             for shim, text in injectable:
                 q.append((shim, text, now))
@@ -939,8 +1029,9 @@ class MidflightMessagePlugin(BasePlugin):
         run = self._run_active.get(sid)
         if run is None:
             return None
-        if time.time() - float(run.get("ts", 0)) > self._active_timeout:
-            self._log_debug(f"{sid} 运行心跳超 {self._active_timeout}s 未更新，判定已结束")
+        timeout = self._current_active_timeout()
+        if time.time() - float(run.get("ts", 0)) > timeout:
+            self._log_debug(f"{sid} 运行心跳超 {timeout}s 未更新，判定已结束")
             self._expire_run(sid, run)
             return None
         return run
@@ -959,6 +1050,7 @@ class MidflightMessagePlugin(BasePlugin):
         if eid:
             self._finished_run[sid] = eid
             self._run_inject_count.pop(eid, None)
+            self._run_step_count.pop(eid, None)
             self._release_queue_merge(sid, eid)
         items = self._pending_inject.pop(sid, None) or []
         if not items:
@@ -1000,6 +1092,7 @@ class MidflightMessagePlugin(BasePlugin):
             eid = getattr(run.get("event"), "event_id", None)
             if eid:
                 self._run_inject_count.pop(eid, None)
+                self._run_step_count.pop(eid, None)
                 # 记下“本轮已收尾”：同一轮里剩下的工具边界（一次 LLM 响应带多个
                 # tool_calls 时会逐个派发 ON_TOOL_RESULT）不得把本轮重新标记为
                 # 运行中；新的一轮会用新的 event_id，不受影响。
@@ -1193,6 +1286,7 @@ class MidflightMessagePlugin(BasePlugin):
         if eid:
             self._finished_run[sid] = eid
             self._run_inject_count.pop(eid, None)
+            self._run_step_count.pop(eid, None)
             self._release_queue_merge(sid, eid)
         logger.warning(
             f"[Midflight] {sid} 软放行后仍无任何活动（LLM 响应 / 工具边界），判定本轮已结束："
@@ -1357,6 +1451,7 @@ class MidflightMessagePlugin(BasePlugin):
             "stop_whitelist_users": self.stop_whitelist_users,
             "whitelist_enabled": self.whitelist_enabled,
             "whitelist_users": self.whitelist_users,
+            "max_inject_per_step": self.max_inject_per_step,
             "max_inject_per_run": self.max_inject_per_run,
             "freshness_seconds": self.freshness_seconds,
             "max_length": self.max_length,
@@ -1373,8 +1468,9 @@ class MidflightMessagePlugin(BasePlugin):
             "allow_image": self.allow_image,
             "allow_file": self.allow_file,
             "allow_forward": self.allow_forward,
-            "_max_inject": self._eff_max_inject,
-            "_freshness": self._eff_freshness,
+            "_max_inject_per_step": self._current_max_inject_per_step(),
+            "_max_inject": self._current_max_inject(),
+            "_freshness": self._current_freshness(),
         }
         if sid and self.overrides:
             for pattern, ov in self.overrides.items():
@@ -1385,16 +1481,29 @@ class MidflightMessagePlugin(BasePlugin):
                         for k, v in ov.items():
                             if k in OVERRIDABLE_KEYS:
                                 cfg[k] = v
-                        # 覆盖后重算自动项
-                        if self._to_int(cfg["max_inject_per_run"], 0) > 0:
-                            cfg["_max_inject"] = self._to_int(cfg["max_inject_per_run"], 0)
-                        ov_fresh = self._to_int(cfg["freshness_seconds"], 0)
-                        if ov_fresh != 0:
-                            cfg["_freshness"] = ov_fresh  # -1=不限，>0=自定义秒数
+                        # 覆盖后重算自动项（0 表示继续跟随系统配置，实时读取；
+                        # -1 表示无限制；>0 表示显式值）
+                        if "freshness_seconds" in ov:
+                            f = self._to_int(cfg["freshness_seconds"], 0)
+                            cfg["_freshness"] = f if f != 0 else self._current_freshness()
                 except Exception:
                     continue
-        cfg["_max_inject"] = max(1, self._to_int(cfg.get("_max_inject"), FALLBACK_MAX_INJECT))
-        cfg["_freshness"] = max(0, self._to_int(cfg.get("_freshness"), FALLBACK_FRESHNESS))
+        # 统一重算两个配额，保证 override 只改 step 时 run 也按新 step 重算
+        step_v = self._to_int(cfg.get("max_inject_per_step"), 0)
+        if step_v == -1:
+            cfg["_max_inject_per_step"] = -1
+        elif step_v > 0:
+            cfg["_max_inject_per_step"] = step_v
+        else:
+            cfg["_max_inject_per_step"] = self._auto_max_inject_per_step()
+        run_v = self._to_int(cfg.get("max_inject_per_run"), 0)
+        if run_v == -1:
+            cfg["_max_inject"] = -1
+        elif run_v > 0:
+            cfg["_max_inject"] = run_v
+        else:
+            cfg["_max_inject"] = self._auto_run_cap(cfg["_max_inject_per_step"])
+        cfg["_freshness"] = max(-1, self._to_int(cfg.get("_freshness"), FALLBACK_FRESHNESS))
         if not isinstance(cfg.get("wake_keywords"), list):
             cfg["wake_keywords"] = []
         if not isinstance(cfg.get("stop_words"), list):
@@ -1599,11 +1708,121 @@ class MidflightMessagePlugin(BasePlugin):
         except Exception:
             return "?"
 
+    def _migrate_config(self, cfg: dict) -> dict:
+        """一次性把旧版 max_inject_per_run 归零，启用新的每步/整轮语义。
+
+        旧值无论 0、4、5、200 都不保留，也不迁到 max_inject_per_step；
+        max_inject_per_step 是新字段，保持默认 0（自动）。
+        config_version=2 只是“已经迁过”的内部标记，避免以后每次启动把用户
+        手动填的新 max_inject_per_run 又清零。
+        """
+        try:
+            if not isinstance(cfg, dict):
+                return {} if cfg is None else cfg
+            if self._to_int(cfg.get("config_version", 1), 1) >= 2:
+                return cfg
+            limits = cfg.get("section_limits")
+            if isinstance(limits, dict) and isinstance(limits.get("fields"), dict):
+                limits = limits["fields"]
+            if not isinstance(limits, dict):
+                limits = {}
+                cfg["section_limits"] = limits
+            old_value = limits.get("max_inject_per_run", 0)
+            limits["max_inject_per_run"] = 0
+            limits.setdefault("max_inject_per_step", 0)
+            cfg["config_version"] = 2
+            try:
+                from core.utils.path_utils import get_config_path
+                path = get_config_path() / "plugins" / "midflight_message_plugin.json"
+                if path.exists():
+                    tmp = path.with_suffix(".json.tmp")
+                    tmp.write_text(json.dumps(cfg, indent=4, ensure_ascii=False), encoding="utf-8")
+                    tmp.replace(path)
+                    logger.info(f"[Midflight] 配置迁移已写回: {path}")
+            except Exception as e:
+                logger.warning(f"[Midflight] 配置迁移写回失败（内存已生效）: {e}")
+            logger.info(
+                f"[Midflight] 配置迁移 v1→v2: max_inject_per_run={old_value!r} 已归零；"
+                f"max_inject_per_step 保持自动；以后 max_inject_per_run 将按乘积实时计算"
+            )
+        except Exception:
+            logger.exception("[Midflight] 配置迁移异常（已忽略，继续使用内存配置）")
+        return cfg
+
     def _read_core_config(self, key: str):
         try:
             return self.ctx.config.get_config(key)
         except Exception:
             return None
+
+    def _current_max_inject_per_step(self) -> int:
+        """实时解析每步上限（与 S/Z 的 property 读法一致）。
+
+        0 = 自动读取 bot_config.bot.max_buffer_messages；-1 = 每步无限制。
+        系统配置变化不会重载插件，因此 auto 值必须每次读取。
+        """
+        if self.max_inject_per_step == -1:
+            return -1
+        if self.max_inject_per_step > 0:
+            return self.max_inject_per_step
+        return self._auto_max_inject_per_step()
+
+    def _auto_max_inject_per_step(self) -> int:
+        """纯自动值：忽略插件显式配置，只读系统 max_buffer_messages。"""
+        auto = self._read_core_config("bot_config.bot.max_buffer_messages")
+        val = self._to_int(auto, FALLBACK_MAX_INJECT)
+        return val if val > 0 else FALLBACK_MAX_INJECT
+
+    def _current_max_tool_loop(self) -> int:
+        """实时读取每轮最大工具循环数；-1 = 无限步，原样保留。"""
+        val = self._to_int(self._read_core_config("bot_config.agent.max_tool_loop"), 5)
+        if val == -1:
+            return -1
+        return val if val > 0 else 1
+
+    def _auto_run_cap(self, step_cap: int) -> int:
+        """0=auto 时的整轮上限 = 每步上限 × 最大工具循环数；-1 表示无限制。"""
+        if step_cap == -1:
+            return -1
+        steps = self._current_max_tool_loop()
+        if steps == -1:
+            return -1
+        return max(1, step_cap * max(1, steps))
+
+    def _current_max_inject(self) -> int:
+        """实时解析整轮上限：0=自动乘积，-1=无限制，>0=显式值。"""
+        if self.max_inject_per_run == -1:
+            return -1
+        if self.max_inject_per_run > 0:
+            return self.max_inject_per_run
+        return self._auto_run_cap(self._current_max_inject_per_step())
+
+    def _current_max_inject_per_run(self) -> int:
+        """语义别名：整轮上限。"""
+        return self._current_max_inject()
+
+    def _current_freshness(self) -> int:
+        """实时解析新鲜度：-1=不限，>0=自定义，0=跟随系统 max_message_interval。"""
+        if self.freshness_seconds < 0:
+            return -1
+        if self.freshness_seconds > 0:
+            return self.freshness_seconds
+        auto = self._read_core_config("bot_config.bot.max_message_interval")
+        val = self._to_int(auto, FALLBACK_FRESHNESS)
+        return val if val > 0 else FALLBACK_FRESHNESS
+
+    def _current_active_timeout(self) -> float:
+        """实时解析“运行中判定超时”：LLM 超时 + 工具超时（跟随系统配置）。"""
+        try:
+            llm_timeout = 120.0
+            client = self.ctx.get_default_llm_client()
+            if client is not None:
+                mc = getattr(getattr(client, "model", None), "model_config", None) or {}
+                llm_timeout = float(mc.get("timeout", 120) or 120)
+            tool_timeout = float(self._read_core_config("bot_config.agent.tool_call_timeout") or 60)
+            return llm_timeout + tool_timeout
+        except Exception:
+            return FALLBACK_ACTIVE_TIMEOUT
 
     def _resolve_wake_keywords(self) -> tuple[list, str]:
         """按 Z版 → S版 → 官方 default-chat 顺序尝试读取已安装聊天插件的唤醒词。"""
@@ -1697,6 +1916,13 @@ class MidflightMessagePlugin(BasePlugin):
                 oldest = min(self._run_inject_count,
                              key=lambda k: self._run_inject_count[k][1])
                 self._run_inject_count.pop(oldest, None)
+        if self._run_step_count:
+            for k in [k for k, (_, _, ts) in self._run_step_count.items() if ts <= cutoff]:
+                self._run_step_count.pop(k, None)
+            while len(self._run_step_count) > 200:
+                oldest = min(self._run_step_count,
+                             key=lambda k: self._run_step_count[k][2])
+                self._run_step_count.pop(oldest, None)
         if len(self._wait_steps) > 200:
             self._wait_steps.clear()
         # 看门狗放行标记：与去重表同 TTL（消息已还原/已处理，标记过期后自然失效）

@@ -99,6 +99,7 @@ class Ctx:
 
 
 CFG = {
+    "config_version": 2,
     "section_basic": {"enabled": True, "inject_timeout_steps": 2, "debug": False},
     "section_flow": {"flow_method_group": "all", "flow_method_dm": "any",
                      "accept_poke": True, "wake_keywords": []},
@@ -211,19 +212,27 @@ async def case_quota_enforced_with_tuple(path):
     assert isinstance(entry, tuple) and entry[0] == 1, f"配额内只应计 1 条，实际 {entry!r}"
     assert "第一条" in t.text and "第二条溢出" not in t.text, \
         f"溢出消息不应进入 tool_result: {t.text!r}"
-    assert len(buf.buffer) == 1 and \
-        getattr(buf.buffer[0].message, "message_id", None) == "2003", \
-        "溢出消息应放回 buffer 头部（保持原顺序）"
+    pending = p._pending_inject.get(SID, [])
+    assert len(pending) == 1 and \
+        getattr(pending[0][0].message, "message_id", None) == "2003", \
+        "溢出消息应转入轮末还原队列（保持原顺序）"
+    assert len(buf.buffer) == 0, "溢出消息不应直接留在共享 buffer"
 
-    # 下一个边界：配额已用完，buffer 里的消息不再被消费、计数不涨、不抛异常
+    # 下一个边界：配额已用完，队列里的消息不再被消费、计数不涨、不抛异常
     t2 = _tool()
     await p._handle_tool_result(ev, t2)
     entry = p._run_inject_count.get(run_id)
     assert isinstance(entry, tuple) and entry[0] == 1, f"配额用完后计数不应再涨，实际 {entry!r}"
     assert "第二条溢出" not in t2.text, "配额用完后不应再注入"
-    assert len(buf.buffer) == 1, "未被消费的消息应继续留在 buffer"
+    assert len(p._pending_inject.get(SID, [])) == 1, "未被消费的消息应继续留在轮末队列"
+
+    # 轮末：必须还原 + flush 成正常新一轮，而不是滞留在 buffer
+    await p._finish_run(SID)
+    assert not p._pending_inject.get(SID), "轮末应清空待还原队列"
+    assert len(ctx.published) == 1, "轮末应 flush 出一条新批次（溢出消息不能滞留）"
+    assert len(buf.buffer) == 0, "flush 后共享 buffer 应为空"
     await p.terminate()
-    return {"配额上限生效": True, "溢出放回buffer": True, "计数封顶": True}
+    return {"配额上限生效": True, "溢出转入轮末队列": True, "轮末还原flush": True, "计数封顶": True}
 
 
 async def main():
