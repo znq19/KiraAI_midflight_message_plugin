@@ -1041,6 +1041,16 @@ class MidflightMessagePlugin(BasePlugin):
             # steer 模式：批次里的普通内容优先 steer；失败/配额不足只 defer，
             # 不回落 tool_result。
             if self._steer_mode():
+                # 若有更早的 pending，先不越过它们；等下一个工具边界按顺序处理
+                if self._pending_inject.get(sid):
+                    self._defer_to_pending(sid, injectable, now, front=False)
+                    self._defer_to_pending(sid, rejected, now, front=False)
+                    self._wait_steps.pop(sid, None)
+                    event.stop()
+                    logger.info(
+                        f"[Midflight] {sid} 已有更早待注入消息，批次排到队尾"
+                    )
+                    return
                 run_id = getattr(run.get("event"), "event_id", None) or sid
                 step = self._to_int(run.get("step", 1), 1)
                 if step <= 0:
@@ -1050,6 +1060,7 @@ class MidflightMessagePlugin(BasePlugin):
                 if quota < len(injectable):
                     self._defer_to_pending(sid, injectable, now, front=False)
                     self._defer_to_pending(sid, rejected, now, front=False)
+                    self._wait_steps.pop(sid, None)
                     event.stop()
                     logger.info(
                         f"[Midflight] {sid} steer 批次延后：step {step} 配额 "
@@ -1060,6 +1071,7 @@ class MidflightMessagePlugin(BasePlugin):
                     self._mark_consumed(injectable, consumed_map, now)
                     self._record_injection(
                         run_id, step, used_step, used_run, len(injectable), now)
+                    self._wait_steps.pop(sid, None)
                     self._defer_to_pending(sid, rejected, now, front=False)
                     event.stop()
                     logger.info(
@@ -1070,6 +1082,7 @@ class MidflightMessagePlugin(BasePlugin):
                     return
                 self._defer_to_pending(sid, injectable, now, front=False)
                 self._defer_to_pending(sid, rejected, now, front=False)
+                self._wait_steps.pop(sid, None)
                 event.stop()
                 logger.info(
                     f"[Midflight] {sid} steer 批次未接受，{len(injectable)} 条"

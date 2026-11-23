@@ -102,11 +102,13 @@ async def step(p, ev, idx, tools=True):
 async def case_batch_steer_true(path):
     p, ctx = await make(path, cfg())
     ev = await start(p)
+    p._wait_steps[SID] = 2
     b = H.batch(H.FakeMessage("201", "m1"), H.FakeMessage("202", "m2"))
     await p.on_batch_dedup(b)
     assert b.is_stopped, "steer accepted must stop batch"
     assert len(ctx.steer_calls) == 1, ctx.steer_calls
     assert not p._pending_inject.get(SID), p._pending_inject
+    assert SID not in p._wait_steps, "steer success must clear stale wait counter"
     assert p._run_inject_count.get(ev.event_id, (0, 0))[0] == 2
     await p.terminate()
     return {"批次 steer 接受": True, "批次被掐": True, "计数 2": True}
