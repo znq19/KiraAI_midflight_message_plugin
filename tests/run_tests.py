@@ -16,7 +16,8 @@ TESTS = Path(__file__).resolve().parent
 SUITES = ["test_phantom_run.py", "test_scenarios.py", "test_stuck_paths.py",
           "test_foreign_event.py", "test_system_event.py", "test_inject_count.py",
           "test_stopped_event_sweep.py", "test_restore_flush_compat.py",
-          "test_format_fallback.py"]
+          "test_format_fallback.py", "test_per_step_quota.py",
+          "test_config_migration.py", "test_steer_mode.py"]
 
 
 def main():

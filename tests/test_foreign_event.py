@@ -112,6 +112,7 @@ class Ctx:
 
 
 CFG = {
+    "config_version": 2,
     "section_basic": {"enabled": True, "inject_timeout_steps": 2, "debug": False},
     "section_flow": {"flow_method_group": "all", "flow_method_dm": "any",
                      "accept_poke": True, "wake_keywords": []},
