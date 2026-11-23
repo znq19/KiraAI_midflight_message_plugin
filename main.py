@@ -140,6 +140,9 @@ class MidflightMessagePlugin(BasePlugin):
         cfg = self._migrate_config(cfg)
 
         basic = cfg.get("section_basic", {}) or {}
+        self.injection_mode = str(basic.get("injection_mode", "tool_result") or "tool_result").strip().lower()
+        if self.injection_mode not in ("tool_result", "steer"):
+            self.injection_mode = "tool_result"
         self.enabled = bool(basic.get("enabled", True))
         self.inject_timeout_steps = self._to_int(basic.get("inject_timeout_steps", 2), 2)
         # 流入队列看门狗（**默认 0 = 关闭**）：拦截进流入队列后，若这么多秒内一直没搭上
@@ -313,7 +316,7 @@ class MidflightMessagePlugin(BasePlugin):
 
         logger.info(
             f"[Midflight] 随时插话 v{self._self_version()} 已加载 | enabled={self.enabled} "
-            f"群聊={self.flow_method_group} 私聊={self.flow_method_dm} "
+            f"模式={self.injection_mode} 群聊={self.flow_method_group} 私聊={self.flow_method_dm} "
             f"poke={self.accept_poke} 停止词={'开' if self.stop_enabled else '关(默认)'} "
             f"上限=每步{self._eff_max_inject_per_step}/整轮{self._eff_max_inject} "
             f"新鲜度={self._eff_freshness}s "
@@ -323,6 +326,11 @@ class MidflightMessagePlugin(BasePlugin):
         )
         self._ensure_watchdog()
         self._ensure_sweeper()
+        if self.injection_mode == "steer" and not self._steer_available():
+            logger.warning(
+                "[Midflight] injection_mode=steer，但当前框架没有 steer_main_agent；"
+                "本实例自动回退 tool_result"
+            )
 
     def _ensure_watchdog(self):
         """启动流入队列看门狗（幂等，可重入）。"""
@@ -430,6 +438,150 @@ class MidflightMessagePlugin(BasePlugin):
         if state and int(state[0]) == int(step):
             return max(0, int(state[1]))
         return 0
+
+    def _steer_available(self) -> bool:
+        return callable(getattr(self.ctx, "steer_main_agent", None))
+
+    def _steer_mode(self) -> bool:
+        return self.injection_mode == "steer" and self._steer_available()
+
+    @staticmethod
+    def _iter_image_elements(chain):
+        """递归遍历 Image/Sticker（含 Reply/Forward 内部）。"""
+        try:
+            for ele in chain or []:
+                if isinstance(ele, (Image, Sticker)):
+                    yield ele
+                elif isinstance(ele, Reply) and getattr(ele, "chain", None):
+                    yield from MidflightMessagePlugin._iter_image_elements(ele.chain)
+                elif isinstance(ele, Forward):
+                    for sub in getattr(ele, "chains", None) or []:
+                        yield from MidflightMessagePlugin._iter_image_elements(sub)
+        except Exception:
+            return
+
+    async def _native_parts(self, message, sid: str) -> list[dict]:
+        """构建 steer 用的原生图片 parts；失败/不可用就返回 []（文本继续）。"""
+        try:
+            existing = getattr(message, "native_content", None)
+            if isinstance(existing, list) and len(existing) > 1:
+                return [p for p in existing[1:] if isinstance(p, dict)]
+            chain = getattr(message, "chain", None)
+            if not any(True for _ in self._iter_image_elements(chain)):
+                return []
+            msg_str = str(getattr(message, "message_str", "") or "")
+            native_marker = ("[Image attached]" in msg_str or "[Sticker attached]" in msg_str)
+            global_mode = str(
+                self._read_core_config("bot_config.capabilities.image_recognition.mode") or ""
+            )
+            if not (native_marker or global_mode == "native"):
+                return []
+            wf_ctx = getattr(
+                getattr(getattr(self.ctx, "message_processor", None), "im_workflow", None),
+                "ctx", None,
+            )
+            media = getattr(wf_ctx, "message_media", None)
+            if media is None or not hasattr(media, "build_native_content"):
+                return []
+            parts = await media.build_native_content(message, sid)
+            if isinstance(parts, list) and len(parts) > 1:
+                return [p for p in parts[1:] if isinstance(p, dict)]
+        except Exception:
+            self._log_debug("steer 原生图片构建失败（已忽略，继续文本流入）")
+        return []
+
+    async def _format_inject_block(self, injectable: list, cfg: dict) -> str:
+        """把可注入消息（及引导语）格式化成官方样式文本块。"""
+        lines = []
+        n = 0
+        for msg_event, text in injectable:
+            n += 1
+            try:
+                message = getattr(msg_event, "message", None)
+                native = str(getattr(message, "message_str", "") or "")
+                if not native:
+                    chain = getattr(message, "chain", None)
+                    if chain:
+                        _wf_ctx = getattr(
+                            getattr(getattr(self.ctx, "message_processor", None), "im_workflow", None),
+                            "ctx", None,
+                        )
+                        _formatter = getattr(_wf_ctx, "message_formatter", None)
+                        if _formatter is not None and hasattr(_formatter, "format_to_text"):
+                            native = await _formatter.format_to_text(chain)
+                        else:
+                            native = await self.ctx.message_processor.message_format_to_text(chain)
+                    else:
+                        native = text
+            except Exception:
+                native = text
+            native = native or text
+            if cfg["max_length"] > 0 and len(native) > cfg["max_length"]:
+                native = native[: cfg["max_length"]] + "…"
+            if cfg["template"]:
+                lines.append(self._render_template(cfg["template"], msg_event, native, n))
+            else:
+                lines.append(self._format_native(msg_event, native))
+        inject_block = "\n".join(line for line in lines if line)
+        if inject_block.strip() and cfg.get("inject_hint") and cfg.get("inject_hint_text"):
+            inject_block = inject_block + "\n" + cfg["inject_hint_text"]
+        return inject_block
+
+    async def _build_steer_message(self, items: list, cfg: dict, sid: str):
+        """构造 steer 用的 str 或 OpenAIMessage（含 native 图片 parts）。"""
+        block = await self._format_inject_block(items, cfg)
+        if not block.strip():
+            return None
+        parts = []
+        for msg_event, _ in items:
+            parts.extend(await self._native_parts(getattr(msg_event, "message", None), sid))
+        if parts:
+            try:
+                from core.agent.message import OpenAIMessage
+                return OpenAIMessage(
+                    role="user",
+                    content=[{"type": "text", "text": block}, *parts],
+                )
+            except Exception:
+                self._log_debug("OpenAIMessage 不可用，steer 退回纯文本")
+        return block
+
+    async def _try_steer(self, sid: str, items: list, cfg: dict) -> bool:
+        if not self._steer_mode() or not items:
+            return False
+        message = await self._build_steer_message(items, cfg, sid)
+        if message is None:
+            return False
+        try:
+            return bool(self.ctx.steer_main_agent(sid, message))
+        except Exception:
+            logger.exception("[Midflight] steer_main_agent 调用异常（回退/延后）")
+            return False
+
+    def _quota_plan(self, cfg: dict, run_id: str, step: int, candidates: int, now: float):
+        used_run = self._run_inject_count.get(run_id, (0, now))[0]
+        used_step = self._step_used(run_id, step)
+        step_cap = cfg["_max_inject_per_step"]
+        run_cap = cfg["_max_inject"]
+        step_left = math.inf if step_cap < 0 else max(0, step_cap - used_step)
+        run_left = math.inf if run_cap < 0 else max(0, run_cap - used_run)
+        if math.isinf(step_left) and math.isinf(run_left):
+            quota = candidates
+        else:
+            quota = max(0, int(min(step_left, run_left)))
+        return quota, used_step, used_run, step_cap, run_cap
+
+    @staticmethod
+    def _mark_consumed(items: list, consumed_map: dict, now: float):
+        for msg_event, _ in items:
+            key = MidflightMessagePlugin._dedup_key(getattr(msg_event, "message", None))
+            if key:
+                consumed_map[key] = now
+
+    def _record_injection(self, run_id: str, step: int, used_step: int,
+                          used_run: int, count: int, now: float):
+        self._run_step_count[run_id] = (step, used_step + count, now)
+        self._run_inject_count[run_id] = (used_run + count, now)
 
     async def _handle_tool_result(self, event: KiraMessageBatchEvent, tool_result):
         cfg = self._eff_config(None)
@@ -551,17 +703,9 @@ class MidflightMessagePlugin(BasePlugin):
         # 每步上限 + 整轮安全上限：超额部分留在流入队列，下一 step 重新获得
         # 步配额；整轮配额用完则轮末统一还原开新轮。
         run_id = getattr(event, "event_id", None) or sid
-        used_run = self._run_inject_count.get(run_id, (0, now))[0]
-        used_step = self._step_used(run_id, step)
-        step_cap = cfg["_max_inject_per_step"]
-        run_cap = cfg["_max_inject"]
-        step_left = math.inf if step_cap < 0 else max(0, step_cap - used_step)
-        run_left = math.inf if run_cap < 0 else max(0, run_cap - used_run)
         candidates = len(injectable)
-        if math.isinf(step_left) and math.isinf(run_left):
-            quota = candidates
-        else:
-            quota = max(0, int(min(step_left, run_left)))
+        quota, used_step, used_run, step_cap, run_cap = self._quota_plan(
+            cfg, run_id, step, candidates, now)
         overflow = injectable[quota:]
         injectable = injectable[:quota]
 
@@ -588,6 +732,28 @@ class MidflightMessagePlugin(BasePlugin):
             await self._finish_run(sid)
             return
 
+        # steer 模式：所有内容优先走 user 消息；失败/配额不足只 defer，
+        # 不回落 tool_result（确认项：steer 模式不使用 tool_result）。
+        if self._steer_mode() and injectable:
+            if await self._try_steer(sid, injectable, cfg):
+                self._mark_consumed(injectable, consumed_map, now)
+                self._record_injection(
+                    run_id, step, used_step, used_run, len(injectable), now)
+                self._wait_steps.pop(sid, None)
+                logger.info(
+                    f"[Midflight] {sid} steer {len(injectable)} 条到当前轮"
+                    f"（step {step}，步 {used_step + len(injectable)}/{step_cap}，"
+                    f"轮 {used_run + len(injectable)}/{run_cap}）"
+                )
+                return
+            self._defer_to_pending(sid, injectable, now, front=False)
+            self._wait_steps.pop(sid, None)
+            logger.info(
+                f"[Midflight] {sid} steer 未接受（step {step}），"
+                f"{len(injectable)} 条转入轮末还原队列"
+            )
+            return
+
         if not injectable:
             # 有候选但被步/整轮配额挡住：不累计等待，下一 step 重新拿步配额；
             # 只有真正全部被过滤（candidates == 0）才累计等待，避免配额阻塞被
@@ -602,62 +768,17 @@ class MidflightMessagePlugin(BasePlugin):
                 self._wait_steps[sid] = waited + 1
             return
 
-        # 原生样式文本化（与官方批次 message_format_to_text 一致）
-        lines = []
-        n = 0
-        for msg_event, text in injectable:
-            n += 1
-            try:
-                message = getattr(msg_event, "message", None)
-                # 优先复用框架渲染时已写入的 message_str（框架在派发钩子前已完成
-                # 文本化，媒体 caption 也已被聊天插件占位，不会触发 VLM）；
-                # 为空（buffer 路径未经渲染）再回退 message_format_to_text
-                native = str(getattr(message, "message_str", "") or "")
-                if not native:
-                    chain = getattr(message, "chain", None)
-                    if chain:
-                        # 双世代：格式化职责在 3.0 迁到 MessageFormatter 服务
-                        # （message_processor.im_workflow.ctx.message_formatter 可达），
-                        # 2.x 在 MessageProcessor.message_format_to_text。
-                        # 逐级 getattr 探测，特征识别不绑版本号。
-                        _wf_ctx = getattr(getattr(getattr(self.ctx, "message_processor", None),
-                                                  "im_workflow", None), "ctx", None)
-                        _formatter = getattr(_wf_ctx, "message_formatter", None)
-                        if _formatter is not None and hasattr(_formatter, "format_to_text"):
-                            native = await _formatter.format_to_text(chain)
-                        else:
-                            native = await self.ctx.message_processor.message_format_to_text(chain)
-                    else:
-                        native = text
-            except Exception:
-                native = text
-            native = native or text
-            if cfg["max_length"] > 0 and len(native) > cfg["max_length"]:
-                native = native[: cfg["max_length"]] + "…"
-            if cfg["template"]:
-                lines.append(self._render_template(cfg["template"], msg_event, native, n))
-            else:
-                # 默认：与官方内置 kira-ai 插件 _format_user_message 完全一致的格式
-                # 群聊: [时间] [message_id: x] [group_name: x group_id: x user_nickname: x, user_id: x] | 内容
-                # 私聊: [时间] [message_id: x] [user_nickname: x, user_id: x] | 内容
-                lines.append(self._format_native(msg_event, native))
-
-        inject_block = "\n".join(line for line in lines if line)
+        # tool_result 旧模式：官方样式文本化
+        inject_block = await self._format_inject_block(injectable, cfg)
         if not inject_block.strip():
             self._wait_steps[sid] = waited + 1
             return
-        # 引导语：让 bot 意识到可以边回边干（只进上下文，不会发出去）
-        if cfg.get("inject_hint") and cfg.get("inject_hint_text"):
-            inject_block = inject_block + "\n" + cfg["inject_hint_text"]
 
-        for m, _ in injectable:
-            key = self._dedup_key(getattr(m, "message", None))
-            if key:
-                consumed_map[key] = now
+        self._mark_consumed(injectable, consumed_map, now)
         # 计数与心跳成对写入：_gc 按 ts 淘汰、读取端按 [0] 取计数，
         # 任何写纯 int 的旁路都会让两处同时炸掉（v1.3.2 回归事故）
-        self._run_step_count[run_id] = (step, used_step + len(injectable), now)
-        self._run_inject_count[run_id] = (used_run + len(injectable), now)
+        self._record_injection(
+            run_id, step, used_step, used_run, len(injectable), now)
         self._wait_steps.pop(sid, None)
 
         base = getattr(tool_result, "text", "") or ""
@@ -915,6 +1036,45 @@ class MidflightMessagePlugin(BasePlugin):
                 logger.info(f"[Midflight] {sid} 批次消息命中停止词，停止当前轮")
                 # 同上：本轮被停后不会再有收尾事件，必须当场收尾，否则留下幽灵运行中
                 await self._finish_run(sid)
+                return
+
+            # steer 模式：批次里的普通内容优先 steer；失败/配额不足只 defer，
+            # 不回落 tool_result。
+            if self._steer_mode():
+                run_id = getattr(run.get("event"), "event_id", None) or sid
+                step = self._to_int(run.get("step", 1), 1)
+                if step <= 0:
+                    step = 1
+                quota, used_step, used_run, step_cap, run_cap = self._quota_plan(
+                    cfg, run_id, step, len(injectable), now)
+                if quota < len(injectable):
+                    self._defer_to_pending(sid, injectable, now, front=False)
+                    self._defer_to_pending(sid, rejected, now, front=False)
+                    event.stop()
+                    logger.info(
+                        f"[Midflight] {sid} steer 批次延后：step {step} 配额 "
+                        f"{quota}/{len(injectable)}，{len(injectable)} 条转入轮末队列"
+                    )
+                    return
+                if await self._try_steer(sid, injectable, cfg):
+                    self._mark_consumed(injectable, consumed_map, now)
+                    self._record_injection(
+                        run_id, step, used_step, used_run, len(injectable), now)
+                    self._defer_to_pending(sid, rejected, now, front=False)
+                    event.stop()
+                    logger.info(
+                        f"[Midflight] {sid} steer 批次 {len(injectable)} 条到当前轮"
+                        f"（step {step}，步 {used_step + len(injectable)}/{step_cap}，"
+                        f"轮 {used_run + len(injectable)}/{run_cap}）"
+                    )
+                    return
+                self._defer_to_pending(sid, injectable, now, front=False)
+                self._defer_to_pending(sid, rejected, now, front=False)
+                event.stop()
+                logger.info(
+                    f"[Midflight] {sid} steer 批次未接受，{len(injectable)} 条"
+                    f"转入轮末还原队列"
+                )
                 return
 
             # 注入：未通过过滤的与可注入的一起转入待注入队列；前者会在轮末

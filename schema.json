@@ -4,6 +4,13 @@
     "name": "基础",
     "collapsed": false,
     "fields": {
+      "injection_mode": {
+        "type": "enum",
+        "options": ["tool_result", "steer"],
+        "default": "tool_result",
+        "name": "注入模式",
+        "hint": "tool_result＝旧模式：所有内容经工具结果注入，兼容 2.x/3.2 beta，模型看到的是 tool 内容。steer＝3.2.0+ 活跃回合的普通内容（含媒体/通知）改为 user 消息，语义更自然；系统触发仍按 passthrough、停止词仍 event.stop；无 steer 接口/失败自动回退 tool_result。steer 可能改变模型行为，且 turn 被 stop 时已接受消息可能被跳过。"
+      },
       "enabled": {
         "type": "switch",
         "default": true,
